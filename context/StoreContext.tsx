@@ -1,8 +1,19 @@
 
 import React, { createContext, useContext, useState, ReactNode, useEffect } from 'react';
 import { AppState, InvestmentPlan, Transaction, User, UserPlan, TeamMember } from '../types';
+import { db } from '../firebaseConfig';
+import { 
+  collection, 
+  doc, 
+  setDoc, 
+  addDoc, 
+  onSnapshot, 
+  updateDoc, 
+  query, 
+  where 
+} from 'firebase/firestore';
 
-// Updated Plans
+// Static Plans (Admin can enable/disable these via code or we can move to DB later)
 const INITIAL_PLANS: InvestmentPlan[] = [
   {
     id: 'plan_1',
@@ -50,7 +61,7 @@ const INITIAL_PLANS: InvestmentPlan[] = [
   }
 ];
 
-// Updated Admin User
+// Special Admin Static User (Bypasses DB Auth for safety of the owner)
 const ADMIN_USER: User = {
   id: 'admin_000',
   name: 'Super Admin',
@@ -86,108 +97,100 @@ interface StoreContextType extends AppState {
 const StoreContext = createContext<StoreContextType | undefined>(undefined);
 
 export const StoreProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  // --- Persistent State Initialization ---
+  const [allUsers, setAllUsers] = useState<User[]>([]);
+  const [globalTransactions, setGlobalTransactions] = useState<Transaction[]>([]);
+  const [globalPlans, setGlobalPlans] = useState<UserPlan[]>([]);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+
+  // --- FIREBASE SYNC ---
   
-  const [allUsers, setAllUsers] = useState<User[]>(() => {
-    const saved = localStorage.getItem('cat_users');
-    return saved ? JSON.parse(saved) : [ADMIN_USER];
-  });
-
-  const [globalTransactions, setGlobalTransactions] = useState<Transaction[]>(() => {
-    const saved = localStorage.getItem('cat_transactions');
-    return saved ? JSON.parse(saved) : [];
-  });
-
-  const [globalPlans, setGlobalPlans] = useState<UserPlan[]>(() => {
-      const saved = localStorage.getItem('cat_plans');
-      return saved ? JSON.parse(saved) : [];
-  });
-  
-  const [currentUser, setCurrentUser] = useState<User | null>(() => {
-      const savedId = localStorage.getItem('cat_session_id');
-      if (savedId) {
-          const users = localStorage.getItem('cat_users');
-          if(users) {
-              const parsedUsers = JSON.parse(users) as User[];
-              return parsedUsers.find(u => u.id === savedId) || null;
-          }
+  // Sync Users
+  useEffect(() => {
+    const unsubscribe = onSnapshot(collection(db, "users"), (snapshot) => {
+      const usersData = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id })) as User[];
+      setAllUsers(usersData);
+      
+      // Real-time update for logged in user
+      if (currentUser && !currentUser.isAdmin) {
+        const updatedSelf = usersData.find(u => u.id === currentUser.id);
+        if (updatedSelf) setCurrentUser(updatedSelf);
       }
-      return null;
-  });
+    }, (error) => {
+      console.error("Error fetching users:", error);
+    });
+    return () => unsubscribe();
+  }, [currentUser?.id, currentUser?.isAdmin]);
 
-  // --- Persistence Effects ---
-
+  // Sync Transactions
   useEffect(() => {
-    localStorage.setItem('cat_users', JSON.stringify(allUsers));
-  }, [allUsers]);
+    const unsubscribe = onSnapshot(collection(db, "transactions"), (snapshot) => {
+      const txData = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id })) as Transaction[];
+      // Sort by date descending
+      txData.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      setGlobalTransactions(txData);
+    });
+    return () => unsubscribe();
+  }, []);
 
+  // Sync Plans
   useEffect(() => {
-    localStorage.setItem('cat_transactions', JSON.stringify(globalTransactions));
-  }, [globalTransactions]);
-
-  useEffect(() => {
-      localStorage.setItem('cat_plans', JSON.stringify(globalPlans));
-  }, [globalPlans]);
-
-  useEffect(() => {
-      if (currentUser) {
-          localStorage.setItem('cat_session_id', currentUser.id);
-      } else {
-          localStorage.removeItem('cat_session_id');
-      }
-  }, [currentUser]);
-
+    const unsubscribe = onSnapshot(collection(db, "user_plans"), (snapshot) => {
+      const planData = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id })) as UserPlan[];
+      setGlobalPlans(planData);
+    });
+    return () => unsubscribe();
+  }, []);
 
   // --- Auth Actions ---
 
   const login = async (phone: string, pass: string) => {
-    return new Promise<void>((resolve, reject) => {
-      setTimeout(() => {
-        const foundUser = allUsers.find(u => u.phone === phone && u.password === pass);
-        if (foundUser) {
-          setCurrentUser(foundUser);
-          resolve();
-        } else {
-          reject(new Error("Invalid credentials"));
-        }
-      }, 500);
-    });
+    // 1. Check Hardcoded Admin
+    if (phone === ADMIN_USER.phone && pass === ADMIN_USER.password) {
+      setCurrentUser(ADMIN_USER);
+      return;
+    }
+
+    // 2. Check Database Users
+    const foundUser = allUsers.find(u => u.phone === phone && u.password === pass);
+    if (foundUser) {
+      setCurrentUser(foundUser);
+    } else {
+      throw new Error("Invalid credentials");
+    }
   };
 
   const register = async (name: string, phone: string, pass: string, refCode?: string) => {
-    return new Promise<void>((resolve, reject) => {
-      setTimeout(() => {
-        if (!name || phone.length < 10 || pass.length < 4) {
-          reject(new Error("Please fill all fields correctly"));
-          return;
-        }
+    if (!name || phone.length < 10 || pass.length < 4) {
+      throw new Error("Please fill all fields correctly");
+    }
 
-        if (allUsers.find(u => u.phone === phone)) {
-            reject(new Error("Phone number already registered"));
-            return;
-        }
+    // Check against local cache of users (which is synced with DB)
+    if (allUsers.find(u => u.phone === phone)) {
+      throw new Error("Phone number already registered");
+    }
 
-        const newUser: User = {
-          id: 'u_' + Date.now(),
-          name: name,
-          phone: phone,
-          password: pass,
-          withdrawalPassword: pass, 
-          balance: 0,
-          referralCode: 'CAT-' + Math.floor(1000 + Math.random() * 9000),
-          referralEarnings: 0,
-          teamCount: 0,
-          kycVerified: false,
-          bankDetails: undefined,
-          referredBy: refCode,
-          isAdmin: false
-        };
+    const newUser: User = {
+      id: 'u_' + Date.now(), // Will be overwritten by doc ref if we use addDoc, but setDoc allows custom ID or we ignore this in DB
+      name: name,
+      phone: phone,
+      password: pass,
+      withdrawalPassword: pass, 
+      balance: 0,
+      referralCode: 'CAT-' + Math.floor(1000 + Math.random() * 9000),
+      referralEarnings: 0,
+      teamCount: 0,
+      kycVerified: false,
+      referredBy: refCode || '',
+      isAdmin: false
+    };
 
-        setAllUsers(prev => [...prev, newUser]);
-        setCurrentUser(newUser);
-        resolve();
-      }, 500);
-    });
+    // Save to Firestore
+    // We use the phone number as the doc ID to ensure uniqueness easily, or a random ID
+    const userRef = doc(collection(db, "users")); 
+    await setDoc(userRef, { ...newUser, id: userRef.id });
+    
+    // Auto login
+    setCurrentUser({ ...newUser, id: userRef.id });
   };
 
   const logout = () => {
@@ -196,276 +199,202 @@ export const StoreProvider: React.FC<{ children: ReactNode }> = ({ children }) =
 
   // --- User Actions ---
 
-  const updateBankDetails = (details: User['bankDetails']) => {
-    if (currentUser) {
-      const updatedUser = { ...currentUser, bankDetails: details };
-      setCurrentUser(updatedUser);
-      setAllUsers(prev => prev.map(u => u.id === currentUser.id ? updatedUser : u));
-    }
+  const updateBankDetails = async (details: User['bankDetails']) => {
+    if (!currentUser) return;
+    const userRef = doc(db, "users", currentUser.id);
+    await updateDoc(userRef, { bankDetails: details });
   };
 
   const changePassword = async (oldPass: string, newPass: string) => {
-    return new Promise<void>((resolve, reject) => {
-        if(!currentUser) return;
-        setTimeout(() => {
-             if (currentUser.password === oldPass) {
-                const updatedUser = { ...currentUser, password: newPass };
-                setCurrentUser(updatedUser);
-                setAllUsers(prev => prev.map(u => u.id === currentUser.id ? updatedUser : u));
-                resolve();
-            } else {
-                reject(new Error("Incorrect old password"));
-            }
-        }, 500);
-    });
+    if (!currentUser) return;
+    if (currentUser.password !== oldPass) throw new Error("Incorrect old password");
+    
+    const userRef = doc(db, "users", currentUser.id);
+    await updateDoc(userRef, { password: newPass });
   };
 
   const changeWithdrawalPassword = async (oldPass: string, newPass: string) => {
-     return new Promise<void>((resolve, reject) => {
-        if(!currentUser) return;
-        setTimeout(() => {
-            if (currentUser.withdrawalPassword === oldPass) {
-                const updatedUser = { ...currentUser, withdrawalPassword: newPass };
-                setCurrentUser(updatedUser);
-                setAllUsers(prev => prev.map(u => u.id === currentUser.id ? updatedUser : u));
-                resolve();
-            } else {
-                reject(new Error("Incorrect old withdrawal password"));
-            }
-        }, 500);
-    });
+    if (!currentUser) return;
+    if (currentUser.withdrawalPassword !== oldPass) throw new Error("Incorrect old withdrawal password");
+    
+    const userRef = doc(db, "users", currentUser.id);
+    await updateDoc(userRef, { withdrawalPassword: newPass });
   };
 
   const deposit = async (amount: number, utr: string) => {
     if (!currentUser) return;
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        const newTx: Transaction = {
-          id: `tx_${Date.now()}`,
-          userId: currentUser.id,
-          userName: currentUser.name,
-          type: 'Deposit',
-          amount,
-          date: new Date().toISOString(),
-          status: 'Pending', 
-          utr: utr,
-          description: `Deposit via UTR: ${utr}`
-        };
-        setGlobalTransactions(prev => [newTx, ...prev]);
-        resolve();
-      }, 500);
-    });
+    
+    const newTx: Omit<Transaction, 'id'> = {
+      userId: currentUser.id,
+      userName: currentUser.name,
+      type: 'Deposit',
+      amount,
+      date: new Date().toISOString(),
+      status: 'Pending', 
+      utr: utr,
+      description: `Deposit via UTR: ${utr}`
+    };
+
+    await addDoc(collection(db, "transactions"), newTx);
   };
 
   const withdraw = async (amount: number, password?: string) => {
     if (!currentUser) return;
-    return new Promise<void>((resolve, reject) => {
-      setTimeout(() => {
-        const now = new Date();
-        const currentHour = now.getHours();
+    
+    const now = new Date();
+    const currentHour = now.getHours();
 
-        // Time Check: 6 AM (6) to 6 PM (18)
-        if (currentHour < 6 || currentHour >= 18) {
-          reject(new Error("Withdrawals are only allowed between 6 AM and 6 PM."));
-          return;
-        }
+    if (currentHour < 6 || currentHour >= 18) {
+      throw new Error("Withdrawals are only allowed between 6 AM and 6 PM.");
+    }
+    if (amount < 150) {
+      throw new Error("Minimum withdrawal amount is ₹150.");
+    }
+    if (!currentUser.bankDetails) {
+      throw new Error("Please add bank details in Profile first.");
+    }
+    if (password && password !== currentUser.withdrawalPassword) {
+      throw new Error("Incorrect Withdrawal Password");
+    }
+    if (currentUser.balance < amount) {
+      throw new Error("Insufficient balance");
+    }
 
-        if (amount < 150) {
-            reject(new Error("Minimum withdrawal amount is ₹150."));
-            return;
-        }
+    const taxAmount = amount * 0.10;
+    const receiveAmount = amount - taxAmount;
 
-        if (!currentUser.bankDetails) {
-            reject(new Error("Please add bank details in Profile first."));
-            return;
-        }
+    // Deduct balance immediately
+    const userRef = doc(db, "users", currentUser.id);
+    await updateDoc(userRef, { balance: currentUser.balance - amount });
 
-        if (password && password !== currentUser.withdrawalPassword) {
-            reject(new Error("Incorrect Withdrawal Password"));
-            return;
-        }
+    const newTx: Omit<Transaction, 'id'> = {
+      userId: currentUser.id,
+      userName: currentUser.name,
+      type: 'Withdraw',
+      amount,
+      date: new Date().toISOString(),
+      status: 'Pending',
+      description: `Withdraw: ₹${amount} (Tax: ₹${taxAmount}, Net: ₹${receiveAmount})`
+    };
 
-        if (currentUser.balance < amount) {
-          reject(new Error("Insufficient balance"));
-          return;
-        }
+    await addDoc(collection(db, "transactions"), newTx);
+  };
 
-        const taxAmount = amount * 0.10;
-        const receiveAmount = amount - taxAmount;
+  const invest = async (plan: InvestmentPlan) => {
+    if (!currentUser) return;
+    if (currentUser.balance < plan.amount) {
+      throw new Error("Insufficient balance");
+    }
 
-        const newTx: Transaction = {
-          id: `tx_${Date.now()}`,
-          userId: currentUser.id,
-          userName: currentUser.name,
-          type: 'Withdraw',
-          amount,
-          date: new Date().toISOString(),
-          status: 'Pending',
-          description: `Withdraw: ₹${amount} (Tax: ₹${taxAmount}, Net: ₹${receiveAmount})`
-        };
-        
-        setGlobalTransactions(prev => [newTx, ...prev]);
-        
-        const updatedUser = { ...currentUser, balance: currentUser.balance - amount };
-        setCurrentUser(updatedUser);
-        setAllUsers(prev => prev.map(u => u.id === currentUser.id ? updatedUser : u));
-        
-        resolve();
-      }, 500);
-    });
+    const endDate = new Date();
+    endDate.setDate(endDate.getDate() + plan.durationDays);
+
+    // 1. Deduct Balance
+    const userRef = doc(db, "users", currentUser.id);
+    await updateDoc(userRef, { balance: currentUser.balance - plan.amount });
+
+    // 2. Add Transaction
+    const newTx: Omit<Transaction, 'id'> = {
+      userId: currentUser.id,
+      userName: currentUser.name,
+      type: 'Investment',
+      amount: plan.amount,
+      date: new Date().toISOString(),
+      status: 'Success',
+      description: `Invested in ${plan.name}`,
+    };
+    await addDoc(collection(db, "transactions"), newTx);
+
+    // 3. Add User Plan
+    const newPlan: Omit<UserPlan, 'id'> = {
+      planId: plan.id,
+      name: plan.name,
+      investedAmount: plan.amount,
+      dailyReturn: plan.dailyReturn,
+      startDate: new Date().toISOString(),
+      endDate: endDate.toISOString(),
+      status: 'Active'
+    };
+    await addDoc(collection(db, "user_plans"), { ...newPlan, userId: currentUser.id }); // Add userId to plan for filtering
   };
 
   // --- Admin Actions ---
 
-  const adminApproveTransaction = (txId: string) => {
-    const txIndex = globalTransactions.findIndex(t => t.id === txId);
-    if (txIndex === -1) return;
-    
-    const tx = globalTransactions[txIndex];
-    if (tx.status !== 'Pending') return;
+  const adminApproveTransaction = async (txId: string) => {
+    const tx = globalTransactions.find(t => t.id === txId);
+    if (!tx || tx.status !== 'Pending') return;
 
-    const updatedTx = { ...tx, status: 'Success' as const };
-    const newTransactions = [...globalTransactions];
-    newTransactions[txIndex] = updatedTx;
-    setGlobalTransactions(newTransactions);
+    const txRef = doc(db, "transactions", txId);
+    await updateDoc(txRef, { status: 'Success' });
 
     if (tx.type === 'Deposit' && tx.userId) {
-        setAllUsers(prev => prev.map(u => {
-            if (u.id === tx.userId) {
-                const updated = { ...u, balance: u.balance + tx.amount };
-                if (currentUser && currentUser.id === u.id) setCurrentUser(updated);
-                return updated;
-            }
-            return u;
-        }));
+      const user = allUsers.find(u => u.id === tx.userId);
+      if (user) {
+        const userRef = doc(db, "users", user.id);
+        await updateDoc(userRef, { balance: user.balance + tx.amount });
+
+        // Handle Referral Bonus (if any logic needed later)
+      }
     }
   };
 
-  const adminRejectTransaction = (txId: string) => {
-    const txIndex = globalTransactions.findIndex(t => t.id === txId);
-    if (txIndex === -1) return;
+  const adminRejectTransaction = async (txId: string) => {
+    const tx = globalTransactions.find(t => t.id === txId);
+    if (!tx || tx.status !== 'Pending') return;
 
-    const tx = globalTransactions[txIndex];
-    if (tx.status !== 'Pending') return;
+    const txRef = doc(db, "transactions", txId);
+    await updateDoc(txRef, { status: 'Failed' });
 
-    const updatedTx = { ...tx, status: 'Failed' as const };
-    const newTransactions = [...globalTransactions];
-    newTransactions[txIndex] = updatedTx;
-    setGlobalTransactions(newTransactions);
-
+    // Refund if withdrawal failed
     if (tx.type === 'Withdraw' && tx.userId) {
-        setAllUsers(prev => prev.map(u => {
-            if (u.id === tx.userId) {
-                const updated = { ...u, balance: u.balance + tx.amount };
-                if (currentUser && currentUser.id === u.id) setCurrentUser(updated);
-                return updated;
-            }
-            return u;
-        }));
+      const user = allUsers.find(u => u.id === tx.userId);
+      if (user) {
+        const userRef = doc(db, "users", user.id);
+        await updateDoc(userRef, { balance: user.balance + tx.amount });
+      }
     }
   };
 
-  const adminUpdateBalance = (userId: string, newBalance: number) => {
-      setAllUsers(prev => prev.map(u => {
-          if (u.id === userId) {
-              const updated = { ...u, balance: newBalance };
-              if (currentUser && currentUser.id === u.id) setCurrentUser(updated);
-              return updated;
-          }
-          return u;
-      }));
+  const adminUpdateBalance = async (userId: string, newBalance: number) => {
+    const userRef = doc(db, "users", userId);
+    await updateDoc(userRef, { balance: newBalance });
   };
 
   const calculateTeamStats = (userId: string) => {
-      // Find user to get referral code
-      const targetUser = allUsers.find(u => u.id === userId);
-      if (!targetUser) return { totalRecharge: 0, totalWithdraw: 0, teamSize: 0 };
+    const targetUser = allUsers.find(u => u.id === userId);
+    if (!targetUser) return { totalRecharge: 0, totalWithdraw: 0, teamSize: 0 };
 
-      // Find all users referred by this user code
-      const directReferrals = allUsers.filter(u => u.referredBy === targetUser.referralCode);
+    const directReferrals = allUsers.filter(u => u.referredBy === targetUser.referralCode);
+    
+    let totalRecharge = 0;
+    let totalWithdraw = 0;
+
+    directReferrals.forEach(refUser => {
+      const userTxs = globalTransactions.filter(t => t.userId === refUser.id && t.status === 'Success');
+      const deposits = userTxs.filter(t => t.type === 'Deposit').reduce((acc, curr) => acc + curr.amount, 0);
+      const withdraws = userTxs.filter(t => t.type === 'Withdraw').reduce((acc, curr) => acc + curr.amount, 0);
       
-      let totalRecharge = 0;
-      let totalWithdraw = 0;
-
-      directReferrals.forEach(refUser => {
-          const userTxs = globalTransactions.filter(t => t.userId === refUser.id && t.status === 'Success');
-          const deposits = userTxs.filter(t => t.type === 'Deposit').reduce((acc, curr) => acc + curr.amount, 0);
-          const withdraws = userTxs.filter(t => t.type === 'Withdraw').reduce((acc, curr) => acc + curr.amount, 0);
-          
-          totalRecharge += deposits;
-          totalWithdraw += withdraws;
-      });
-
-      return {
-          totalRecharge,
-          totalWithdraw,
-          teamSize: directReferrals.length
-      };
-  };
-
-  // --- Investment Logic ---
-
-  const invest = async (plan: InvestmentPlan) => {
-    if (!currentUser) return;
-    return new Promise<void>((resolve, reject) => {
-      setTimeout(() => {
-        if (currentUser.balance < plan.amount) {
-          reject(new Error("Insufficient balance"));
-          return;
-        }
-
-        const newTx: Transaction = {
-          id: `tx_${Date.now()}`,
-          userId: currentUser.id,
-          userName: currentUser.name,
-          type: 'Investment',
-          amount: plan.amount,
-          date: new Date().toISOString(),
-          status: 'Success',
-          description: `Invested in ${plan.name}`,
-        };
-
-        const endDate = new Date();
-        endDate.setDate(endDate.getDate() + plan.durationDays);
-
-        const newPlan: UserPlan = {
-          id: `uplan_${Date.now()}`,
-          planId: plan.id,
-          name: plan.name,
-          investedAmount: plan.amount,
-          dailyReturn: plan.dailyReturn,
-          startDate: new Date().toISOString(),
-          endDate: endDate.toISOString(),
-          status: 'Active'
-        };
-
-        setGlobalTransactions(prev => [newTx, ...prev]);
-        setGlobalPlans(prev => [newPlan, ...prev]);
-
-        const updatedUser = { ...currentUser, balance: currentUser.balance - plan.amount };
-        setCurrentUser(updatedUser);
-        setAllUsers(prev => prev.map(u => u.id === currentUser.id ? updatedUser : u));
-
-        resolve();
-      }, 500);
+      totalRecharge += deposits;
+      totalWithdraw += withdraws;
     });
+
+    return {
+      totalRecharge,
+      totalWithdraw,
+      teamSize: directReferrals.length
+    };
   };
 
   // --- Derived State ---
   
   const transactions = currentUser ? globalTransactions.filter(t => t.userId === currentUser.id) : [];
-  const activePlans = currentUser ? globalPlans.filter(p => {
-       // Only show plans for current user? In real app yes. 
-       // For this prototype, let's filter if we stored userId in plans. 
-       // Currently UserPlan doesn't have userId. 
-       // We can assume globalPlans contains plans for current user or just show all for simplicity if we don't change UserPlan type.
-       // Ideally we should match against user's transactions or add userId to UserPlan.
-       // For now, let's keep it simple: Filter by matching transaction date roughly or just show all active plans (simplified).
-       // Actually, best to just show all for the prototype user unless we add userId to UserPlan.
-       return true; 
-  }) : []; 
   
-  const teamMembers = [] as TeamMember[]; // Computed in Team View or helper
+  // Filter plans for current user. 
+  // Note: We need to filter globalPlans based on userId. 
+  // Since we added userId to the doc in `invest`, we check `(p as any).userId`.
+  const activePlans = currentUser ? globalPlans.filter(p => (p as any).userId === currentUser.id) : [];
+  
+  const teamMembers = [] as TeamMember[]; // Computed elsewhere if needed, or we can compute real team here
   const pendingTransactions = currentUser?.isAdmin ? globalTransactions.filter(t => t.status === 'Pending') : [];
 
   return (
